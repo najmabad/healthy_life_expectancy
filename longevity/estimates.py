@@ -8,6 +8,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+
 class LongevityEstimator:
     """
     Longevity Estimator class containing all the
@@ -16,22 +20,25 @@ class LongevityEstimator:
     longevity.DataManager
     """
 
-    def __init__(self, df: pd.DataFrame, panel_df: pd.DataFrame, gender: str, income_dcl: int):
+    def __init__(self, df: pd.DataFrame, panel_df: pd.DataFrame, gender: str, income_dcl: int, coeffs: dict = None):
         """
         Initialize a LongevityEstimator object
         :param df: a dataframe resulting from a call to longevity.DataManager.prepare_dataset
         :param panel_df: a dataframe resulting from a call to longevity.DataManager.create_panel_dataset
         :param gender: the gender of the individual, can be "male" or "female"
+        :param coeffs: optionally pass the coefficients of the LR
         :param income_dcl:
         """
         self.df = df
         self.panel_df = panel_df
-        self.dis_prev_by_ctry_and_age = LongevityEstimator.compute_disability_prevalence_by_age(df)
+        self.panel_df.loc[:, 'age_2'] = self.panel_df.age ** 2
+        self.disability_prevalence = LongevityEstimator.compute_disability_prevalence_by_age(df)
         self.start_age, self.end_age = int(self.df.age.min()), int(self.df.age.max()) + 1
         self.diff = int(self.end_age - self.start_age)
         self.gender = gender
         self.income_dcl = income_dcl
         self.income_buckets = len(self.df.income_dcl.unique())
+        self.coeffs = coeffs
         self.clf = Pipeline([
             ('scaler', StandardScaler(with_std=False, with_mean=False)),
             ('lr', LogisticRegression())
@@ -45,15 +52,15 @@ class LongevityEstimator:
         :return: the disability prevalence matrix
         """
         return (pd.pivot_table(
-            df[df['disabled'] == 1],
-            columns=['gender'],
-            index=['income_dcl', 'is_aged'],
+            df[(df['disabled'] == 1) & (df['is_aged'] < 88)],
+            columns=['income_dcl'],
+            index=['is_aged'],
             values=['mergeid'],
             aggfunc='count'
         ).replace(np.nan, 0) / pd.pivot_table(
-            df,
-            columns=['gender'],
-            index=['income_dcl', 'is_aged'],
+            df[(df['disabled'] == 0) & (df['is_aged'] < 88)],
+            columns=['income_dcl'],
+            index=['is_aged'],
             values=['mergeid'],
             aggfunc='count'
         )).to_dict()
@@ -81,12 +88,12 @@ class LongevityEstimator:
         :return: a float representing the disability prevalence
                  for the specified age class
         """
-        ps = [self.dis_prev_by_ctry_and_age[('mergeid', self.gender)].get((self.income_dcl, age), 0) for age in
+        ps = [self.disability_prevalence[('mergeid', self.income_dcl)].get(float(age), 0) for age in
               range(self.start_age, self.end_age)]
-        #for idx, i in enumerate(ps):
+        # for idx, i in enumerate(ps):
         #    if np.isnan(i):
         #        ps[idx] = 0 if idx == 0 else ps[idx - 1]
-        #ps = self.smooth_disability_curve(ps)
+        # ps = self.smooth_disability_curve(ps)
         return ps[int(age - self.start_age)]
 
     def generate_prevalence_matrix(self) -> np.array:
@@ -105,23 +112,41 @@ class LongevityEstimator:
         Computes the U and P matrices as defined in Caswell, Zarulli (2018)
         :return: U and P matrices
         """
-        self.clf.fit(self.panel_df[['age', 'income_dcl', 'gender_num']], self.panel_df['y'])
+        if not self.coeffs:
+            self.clf.fit(self.panel_df[['age', 'income_dcl', 'gender_num']], self.panel_df['y'])
 
-        lr = self.clf.named_steps['lr']
-        scaler = self.clf.named_steps['scaler']
-        print(lr.coef_)
+            lr = self.clf.named_steps['lr']
+            scaler = self.clf.named_steps['scaler']
 
         P = np.hstack(
             [np.zeros((self.diff + 1, self.diff)), np.hstack([np.zeros(self.diff), [1]]).reshape(self.diff + 1, 1)])
         for age in range(self.start_age, self.end_age):
-            row = [age, self.income_dcl, 1 if self.gender == 'female' else 0]
-            row = scaler.transform([row])
+            if not self.coeffs:
+                row = [age, self.income_dcl, 1 if self.gender == 'female' else 0]
+                row = scaler.transform([row])
             if age != 90:
-                p_alive, p_dead = lr.predict_proba(row)[0]
+                if not self.coeffs:
+                    p_alive, p_dead = lr.predict_proba(row)[0]
+                else:
+                    p_dead = sigmoid(
+                        self.coeffs['age'] * age +
+                        self.coeffs['income_dcl'] * self.income_dcl +
+                        self.coeffs['gender_num'] * (1 if self.gender == 'female' else 0)
+                    )
+                    p_alive = 1 - p_dead
                 P[age - (self.start_age - 1), age - self.start_age] = p_alive
                 P[self.diff, age - self.start_age] = p_dead
             else:
-                P[self.diff - 1, self.diff - 1] = lr.predict_proba(row)[0][0]
+                if not self.coeffs:
+                    p_alive, p_dead = lr.predict_proba(row)[0]
+                else:
+                    p_dead = sigmoid(
+                        self.coeffs['age'] * age +
+                        self.coeffs['income_dcl'] * self.income_dcl +
+                        self.coeffs['gender_num'] * (1 if self.gender == 'female' else 0)
+                    )
+                    p_alive = 1 - p_dead
+                P[self.diff - 1, self.diff - 1] = p_alive
                 P[self.diff, self.diff - 1] = p_dead
         U = P[:self.diff, :self.diff]
         return U, P
